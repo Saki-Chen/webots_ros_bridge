@@ -24,7 +24,7 @@
 #include <webots/GPS.hpp>
 #include <webots/Keyboard.hpp>
 #include <webots/Lidar.hpp>
-#include <webots/vehicle/Driver.hpp>
+#include <webots/vehicle/Car.hpp>
 
 #include <cmath>
 #include <string>
@@ -32,7 +32,13 @@
 #include <iostream>
 #include <iomanip>
 
+#include "webots_ros_publisher.hpp"
+
+using namespace webots_ros_bridge;
 using namespace webots;
+
+ros::Publisher velodyne_pub;
+ros::Publisher clock_pub;
 
 // to be used as array indices
 enum
@@ -60,8 +66,9 @@ bool enable_collision_avoidance = false;
 bool enable_display = false;
 bool has_gps = false;
 bool has_camera = false;
+bool enable_velodyne = false;
 
-Driver *driver;
+Car *car;
 
 // camera
 Camera *camera;
@@ -74,6 +81,11 @@ Lidar *sick;
 int sick_width = -1;
 double sick_range = -1.0;
 double sick_fov = -1.0;
+
+//Velodyne
+Lidar *velodyne;
+double velodyne_max_range = -1;
+int velodyne_cloud_size = -1;
 
 // speedometer
 Display *display;
@@ -131,9 +143,9 @@ void set_speed(double kmh)
 
   speed = kmh;
 
-  std::cout << "setting speed to" << std::fixed << std::setprecision(0) << " km/h\n";
+  std::cout << "setting speed to " << std::fixed << std::setprecision(0) << kmh << " km/h\n";
 
-  driver->setCruisingSpeed(kmh);
+  car->setCruisingSpeed(kmh);
 }
 
 // positive: turn right, negative: turn left
@@ -150,7 +162,7 @@ void set_steering_angle(double wheel_angle)
     wheel_angle = 0.5;
   else if (wheel_angle < -0.5)
     wheel_angle = -0.5;
-  driver->setSteeringAngle(wheel_angle);
+  car->setSteeringAngle(wheel_angle);
 }
 
 void change_manual_steer_angle(int inc)
@@ -300,7 +312,7 @@ void update_display()
   display->imagePaste(speedometer_image, 0, 0);
 
   // draw speedometer needle
-  double current_speed = driver->getCurrentSpeed();
+  double current_speed = car->getCurrentSpeed();
   if (std::isnan(current_speed))
     current_speed = 0.0;
   double alpha = current_speed / 260.0 * 3.72 - 0.27;
@@ -353,19 +365,38 @@ double applyPID(double yellow_line_angle)
   return KP * yellow_line_angle + KI * integral + KD * diff;
 }
 
+void velodyne_process()
+{
+  const LidarPoint* cloud = velodyne->getPointCloud();
+
+  WebotsRosPubisher::getInstance().publishPointCloud(cloud, velodyne_cloud_size, velodyne_max_range - 2);
+
+}
+
 int main(int argc, char **argv)
 {
-  Driver driver_instance;
-  driver = &driver_instance;
 
-  sick = driver->getLidar("Sick LMS 291");
-  display = driver->getDisplay("display");
-  gps = driver->getGPS("gps");
-  camera = driver->getCamera("camera");
-  keyboard = driver->getKeyboard();
+  ros::init(argc,argv,"controller");
+
+  WebotsRosPubisher& ros_pub =  WebotsRosPubisher::getInstance();
+
+  ros_pub.enableSimulationMode();
+
+  Car car_instance;
+  car = &car_instance;
+  
+
+  sick = car->getLidar("Sick LMS 291");
+  velodyne = car->getLidar("Velodyne VLP-16");
+  display = car->getDisplay("display");
+  gps = car->getGPS("gps");
+  camera = car->getCamera("camera");
+  keyboard = car->getKeyboard();
 
   if (NULL != sick)
     enable_collision_avoidance = true;
+  if(NULL != velodyne)
+    enable_velodyne = true;
   if (NULL != display)
     enable_display = true;
   if (NULL != gps)
@@ -391,6 +422,14 @@ int main(int argc, char **argv)
     sick_fov = sick->getFov();
   }
 
+  if(enable_velodyne)
+  {
+    velodyne->enable(TIME_STEP);
+    velodyne->enablePointCloud();
+    velodyne_max_range = velodyne->getMaxRange();
+    velodyne_cloud_size = velodyne->getNumberOfPoints();
+  }
+
   // initialize gps
   if (has_gps)
     gps->enable(TIME_STEP);
@@ -401,11 +440,11 @@ int main(int argc, char **argv)
 
   // start engine
   if (has_camera)
-    set_speed(50.0); // km/h
-  driver->setHazardFlashers(true);
-  driver->setDippedBeams(true);
-  driver->setAntifogLights(true);
-  driver->setWiperMode(Driver::WiperMode::SLOW);
+    set_speed(20.0); // km/h
+  car->setHazardFlashers(true);
+  car->setDippedBeams(true);
+  car->setAntifogLights(true);
+  car->setWiperMode(Car::WiperMode::SLOW);
 
   print_help();
 
@@ -413,15 +452,22 @@ int main(int argc, char **argv)
   keyboard->enable(TIME_STEP);
 
   // main loop
-  while (driver->step() != -1)
+  while (car->step() != -1)
   {
+    ros_pub.publishClock(car->getTime() * 1e6);
+    ros_pub.publishSteeringAngle(car->getSteeringAngle());
+    ros_pub.publishWheelEncoder(car->getWheelEncoder(Car::WheelIndex::WHEEL_FRONT_LEFT),
+                                car->getWheelEncoder(Car::WheelIndex::WHEEL_FRONT_RIGHT),
+                                car->getWheelEncoder(Car::WheelIndex::WHEEL_REAR_LEFT),
+                                car->getWheelEncoder(Car::WheelIndex::WHEEL_REAR_RIGHT));
+                               
 
     // get user input
     check_keyboard();
     static int i = 0;
 
     // updates sensors only every TIME_STEP milliseconds
-    if (i % (int)(TIME_STEP / driver->getBasicTimeStep()) == 0)
+    if (i % (int)(TIME_STEP / car->getBasicTimeStep()) == 0)
     {
       // read sensors
 
@@ -444,7 +490,7 @@ int main(int argc, char **argv)
         if (enable_collision_avoidance && obstacle_angle != UNKNOWN)
         {
           // an obstacle has been detected
-          driver->setBrakeIntensity(0.0);
+          car->setBrakeIntensity(0.0);
           // compute the steering angle required to avoid the obstacle
           double obstacle_steering = steering_angle;
           if (obstacle_angle > 0.0 && obstacle_angle < 0.4)
@@ -469,13 +515,13 @@ int main(int argc, char **argv)
         else if (yellow_line_angle != UNKNOWN)
         {
           // no obstacle has been detected, simply follow the line
-          driver->setBrakeIntensity(0.0);
+          car->setBrakeIntensity(0.0);
           set_steering_angle(applyPID(yellow_line_angle));
         }
         else
         {
           // no obstacle has been detected but we lost the line => we brake and hope to find the line again
-          driver->setBrakeIntensity(0.4);
+          car->setBrakeIntensity(0.4);
           PID_need_reset = true;
         }
       }
@@ -485,6 +531,8 @@ int main(int argc, char **argv)
         compute_gps_speed();
       if (enable_display)
         update_display();
+      if(enable_velodyne)
+        velodyne_process();
     }
 
     ++i;
